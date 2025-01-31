@@ -1,69 +1,121 @@
-import { Router } from "express";
-import { PrismaClient } from "@prisma/client";
-import jwt from "jsonwebtoken";
+import { Router, type Response } from "express";
+import { PrismaClient, type Slot } from "@prisma/client";
+import { type AuthRequest, authMiddleware } from "../middleware/auth";
 
 const router = Router();
 const prisma = new PrismaClient();
 
-const authMiddleware = (req: any, res: any, next: any) => {
-  const token = req.headers.authorization?.split(" ")[1];
-  if (!token) return res.status(401).json({ error: "Unauthorized" });
-
+// Professors Set Availability Slots
+router.post("/slots", authMiddleware, async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || "secret");
-    req.user = decoded;
-    next();
-  } catch {
-    res.status(401).json({ error: "Invalid token" });
+    if (!req.user || req.user.role !== "PROFESSOR") {
+      res.status(403).json({ error: "Only professors can create slots" });
+      return;
+    }
+
+    const { time, duration }: { time: string; duration: number } = req.body;
+    const endTime = new Date(new Date(time).getTime() + duration * 60000);
+
+    const slot: Slot = await prisma.slot.create({
+      data: {
+        professorId: req.user.id,
+        professorName: req.user.name,
+        time: new Date(time),
+        endTime,
+        isBooked: false,
+      },
+    });
+
+    res.json({ message: "Slot created", slot });
+  } catch (error) {
+    res.status(500).json({ error: "Internal Server Error" });
   }
-};
-
-// Professors set availability
-router.post("/slots", authMiddleware, async (req: any, res) => {
-  if (req.user.role !== "PROFESSOR") return res.status(403).json({ error: "Access denied" });
-
-  const { time } = req.body;
-  const slot = await prisma.slot.create({
-    data: { professorId: req.user.userId, time: new Date(time), isBooked: false },
-  });
-
-  res.json({ message: "Slot created", slot });
 });
 
-// Students view available slots
-router.get("/slots", authMiddleware, async (req, res) => {
-  const slots = await prisma.slot.findMany({ where: { isBooked: false } });
-  res.json(slots);
+// Students View Available Slots
+router.get("/slots", authMiddleware, async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const slots = await prisma.slot.findMany({
+      where: { isBooked: false },
+      select: { id: true, time: true, endTime: true, professorName: true },
+    });
+
+    res.json(slots);
+  } catch (error) {
+    res.status(500).json({ error: "Internal Server Error" });
+  }
 });
 
-// Students book an appointment
-router.post("/book", authMiddleware, async (req: any, res) => {
-  if (req.user.role !== "STUDENT") return res.status(403).json({ error: "Access denied" });
+// Students Book an Appointment
+router.post("/book", authMiddleware, async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!req.user || req.user.role !== "STUDENT") {
+      res.status(403).json({ error: "Only students can book appointments" });
+      return;
+    }
 
-  const { slotId } = req.body;
-  const slot = await prisma.slot.update({
-    where: { id: slotId, isBooked: false },
-    data: { isBooked: true, booking: { create: { studentId: req.user.userId } } },
-  });
+    const { slotId }: { slotId: string } = req.body;
+    const slot = await prisma.slot.findUnique({ where: { id: slotId } });
 
-  res.json({ message: "Appointment booked", slot });
+    if (!slot || slot.isBooked) {
+      res.status(400).json({ error: "Slot not available" });
+      return;
+    }
+
+    await prisma.booking.create({
+      data: { studentId: req.user.id, slotId },
+    });
+
+    await prisma.slot.update({ where: { id: slotId }, data: { isBooked: true } });
+
+    res.json({ message: "Appointment booked" });
+  } catch (error) {
+    res.status(500).json({ error: "Internal Server Error" });
+  }
 });
 
-// Professors cancel an appointment
-router.delete("/cancel/:id", authMiddleware, async (req: any, res) => {
-  if (req.user.role !== "PROFESSOR") return res.status(403).json({ error: "Access denied" });
+// Professors Cancel an Appointment
+router.delete("/cancel/:slotId", authMiddleware, async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!req.user || req.user.role !== "PROFESSOR") {
+      res.status(403).json({ error: "Only professors can cancel appointments" });
+      return;
+    }
 
-  const { id } = req.params;
-  await prisma.booking.delete({ where: { slotId: id } });
-  await prisma.slot.update({ where: { id }, data: { isBooked: false } });
+    const { slotId } = req.params;
+    const booking = await prisma.booking.findUnique({ where: { slotId } });
 
-  res.json({ message: "Appointment canceled" });
+    if (!booking) {
+      res.status(404).json({ error: "Appointment not found" });
+      return;
+    }
+
+    await prisma.booking.delete({ where: { slotId } });
+    await prisma.slot.update({ where: { id: slotId }, data: { isBooked: false } });
+
+    res.json({ message: "Appointment canceled" });
+  } catch (error) {
+    res.status(500).json({ error: "Internal Server Error" });
+  }
 });
 
-// Students check their appointments
-router.get("/appointments", authMiddleware, async (req: any, res) => {
-  const bookings = await prisma.booking.findMany({ where: { studentId: req.user.userId }, include: { slot: true } });
-  res.json(bookings);
+// Students Check Their Appointments
+router.get("/appointments", authMiddleware, async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!req.user) {
+      res.status(401).json({ error: "Unauthorized" });
+      return;
+    }
+
+    const bookings = await prisma.booking.findMany({
+      where: { studentId: req.user.id },
+      include: { slot: true },
+    });
+
+    res.json(bookings);
+  } catch (error) {
+    res.status(500).json({ error: "Internal Server Error" });
+  }
 });
 
 export default router;
